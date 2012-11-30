@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+#
+# Copyright (C) 2012 Ruslan Kabalin, Lancaster University, UK
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; version 2 dated June,
+# 1991.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301 USA.
+
+=head1 NAME
+
+mahara_ - Plugin for monitoring various Mahara stats
+
+=head1 CONFIGURATION
+
+Configuration is done through libpq environment variables, for example PGUSER,
+PGHOST, etc. But generally it is easier if you run the plugin on the database
+server as postgres user. For more information, see L<Munin::Plugin::Pgsql> and
+L<http://munin-monitoring.org/wiki/plugin-conf.d>.
+
+In order to make this plugin work, you need to specify the name of the mahara
+database via symlink to the plugin, i.e. mahara_<databasename>. For more
+information see L<http://munin-monitoring.org/wiki/WildcardPlugins>.
+
+Plugin configuration variables:
+
+env.updatetime - you may configure the period for which the time-based data is
+calculated (e.g. used in the number of logged-in users reporting or
+assignments submissions). By default the value of 300 sec is used  (5 min
+Munin default update interval).
+
+env.dbprefix - if you use specific database prefix set the correct value using
+this parameter.
+
+env.showdefaultpages - whether to show default/system pages on the graph (user
+dashboard, user profile, group home page). Can be enabled by setting this
+variable to 1. Disabled by default.
+
+=head1 SEE ALSO
+
+L<Munin::Plugin::Pgsql>
+L<http://munin-monitoring.org/wiki/plugin-conf.d>
+
+=head1 MAGIC MARKERS
+
+ #%# family=auto
+ #%# capabilities=autoconf suggest
+
+=head1 AUTHOR
+
+Copyright (C) 2012 Ruslan Kabalin, Lancaster University, UK
+
+=head1 COPYRIGHT/License.
+
+Copyright (C) 2012 Ruslan Kabalin, Lancaster University, UK
+
+All rights reserved. This program is free software; you can
+redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation; version 2
+dated June, 1991.
+
+=cut
+
+use strict;
+use warnings;
+
+use Munin::Plugin;
+use Munin::Plugin::Pgsql;
+use POSIX;
+
+need_multigraph();
+
+# Initial settings
+my $updatetime = 300;
+$updatetime = $ENV{"updatetime"} if (defined $ENV{"updatetime"});
+my $dbprefix = '';
+$dbprefix = $ENV{"dbprefix"} if (defined $ENV{"dbprefix"});
+my $showdefaultpages = 0;
+$showdefaultpages = $ENV{"showdefaultpages"} if (defined $ENV{"showdefaultpages"});
+
+my $timefrom = 100 * floor((time()-$updatetime) / 100);
+
+# Number of logged-in users
+print "multigraph maharausers\n";
+
+my $pg = Munin::Plugin::Pgsql->new(
+    basename => 'mahara_',
+    paramdatabase => 1,
+    category => 'Mahara',
+    title    => 'Mahara users',
+    info     => 'Number of active users',
+    vlabel   => 'Users',
+    extraconfig => 'graph_scale no',
+    pivotquery => 1,
+    basequery => "SELECT COUNT(username) as users FROM ${dbprefix}usr
+        WHERE deleted = 0 AND lastaccess > to_timestamp($timefrom)",
+    configquery => "VALUES ('users', 'Users')",
+    graphdraw => 'AREA',
+);
+
+$pg->Process();
+
+# Number of pages
+print "\n";
+print "multigraph maharapages\n";
+
+my $basequery = "SELECT 'userportfolio', count(id) FROM ${dbprefix}view WHERE owner IS NOT NULL AND type = 'portfolio'
+    UNION SELECT 'groupportfolio', count(id) FROM ${dbprefix}view WHERE \"group\" IS NOT NULL AND type = 'portfolio'
+    UNION SELECT 'instportfolio', count(id) FROM ${dbprefix}view WHERE institution IS NOT NULL AND type = 'portfolio'";
+
+my $configquery = "VALUES ('userportfolio', 'User pages'),
+        ('groupportfolio', 'Groups pages'),
+        ('instportfolio', 'Institution pages')";
+
+my $extraconfig = "graph_scale no\ntotal.cdef userportfolio,groupportfolio,instportfolio,+,+";
+
+if ($showdefaultpages) {
+    $basequery .= "\nUNION SELECT 'userprofile', count(id) FROM ${dbprefix}view WHERE owner IS NOT NULL AND type = 'profile'
+        UNION SELECT 'userdashboard', count(id) FROM ${dbprefix}view WHERE owner IS NOT NULL AND type = 'dashboard'
+        UNION SELECT 'grouphomepage', count(id) FROM ${dbprefix}view WHERE \"group\" IS NOT NULL AND type = 'grouphomepage'";
+    $configquery .= ", ('userprofile', 'User profile pages'), 
+        ('userdashboard', 'User dashboard pages'),
+        ('grouphomepage', 'Groups home pages')";
+    $extraconfig .= ",userdashboard,grouphomepage,+";
+}
+
+$extraconfig .= "\ntotal.label Total";
+
+$pg = Munin::Plugin::Pgsql->new(
+    basename => 'mahara_',
+    paramdatabase => 1,
+    category => 'Mahara',
+    title    => 'Mahara pages',
+    info     => 'Number of pages',
+    vlabel   => 'Pages',
+    extraconfig => $extraconfig,
+    basequery => $basequery,
+    configquery => $configquery, 
+    graphdraw => 'AREA',
+    stack => 1,
+);
+
+$pg->Process();
+
+# Number of groups
+print "\n";
+print "multigraph maharagroups\n";
+
+$pg = Munin::Plugin::Pgsql->new(
+    basename => 'mahara_',
+    paramdatabase => 1,
+    category => 'Mahara',
+    title    => 'Mahara groups',
+    info     => 'Number of groups',
+    vlabel   => 'Groups',
+    extraconfig => 'graph_scale no',
+    basequery => "SELECT grouptype || jointype || CASE WHEN request=0 THEN 'nonreq' ELSE 'req' END, COUNT(name)
+        FROM \"${dbprefix}group\" WHERE deleted = 0
+        GROUP BY grouptype, jointype, request",
+    configquery => "VALUES
+        ('standardapprovenonreq', 'Standard - By invitation'), 
+        ('standardapprovereq', 'Standard - Request'),
+        ('standardopennonreq', 'Standard - Open'),
+        ('standardcontrollednonreq', 'Standard - Controlled'),
+        ('standardcontrolledreq', 'Standard - Controlled, Request'),
+        ('courseapprovenonreq', 'Course - By invitation'), 
+        ('courseapprovereq', 'Course - Request'),
+        ('courseopennonreq', 'Course - Open'),
+        ('coursecontrollednonreq', 'Course - Controlled'),
+        ('coursecontrolledreq', 'Course - Controlled, Request')",
+    graphdraw => 'AREA',
+    stack => 1,
+);
+
+$pg->Process();
+
+# Files
+print "\n";
+print "multigraph maharafiles\n";
+
+$pg = Munin::Plugin::Pgsql->new(
+    basename => 'mahara_',
+    paramdatabase => 1,
+    category => 'Mahara',
+    title    => 'Mahara disk usage',
+    info     => 'The total size of mahara files',
+    vlabel   => 'Size',
+    extraconfig => "total.cdef audio,application,video,image,text,+,+,+,+\ntotal.label Total",
+    basequery => "SELECT iq.filetype, SUM(iq.size) FROM
+        (SELECT regexp_replace(filetype, '/.+\$', '') AS filetype, size FROM
+        artefact_file_files) iq
+        GROUP BY iq.filetype",
+    configquery => "VALUES ('audio', 'Audio'), ('application', 'Application'),
+        ('video', 'Video'), ('image', 'Image'), ('text', 'Text')",
+    graphdraw => 'AREA',
+    base => 1024,
+    stack => 1,
+);
+
+$pg->Process();
+
+# Forums
+print "\n";
+print "multigraph maharaactivity\n";
+
+$pg = Munin::Plugin::Pgsql->new(
+    basename => 'mahara_',
+    paramdatabase => 1,
+    category => 'Mahara',
+    title    => 'Mahara activity',
+    info     => 'Various Mahara activities stats',
+    vlabel   => 'Items',
+    extraconfig => 'graph_scale no',
+    basequery => "SELECT 'wallposts', COUNT(id) FROM blocktype_wall_post WHERE postdate > to_timestamp($timefrom)
+    UNION SELECT 'blogposts', COUNT(artefacttype) FROM artefact WHERE artefacttype = 'blogpost' AND ctime > to_timestamp($timefrom)
+    UNION SELECT 'forumposts', COUNT(id) FROM interaction_forum_post WHERE deleted = 0 AND ctime > to_timestamp($timefrom)",
+    configquery => "VALUES ('wallposts', 'Wall posts'), ('blogposts', 'Journal posts'), ('forumposts', 'Forum posts')",
+    graphdraw => 'LINE1',
+);
+
+$pg->Process();
+
+exit(0);
